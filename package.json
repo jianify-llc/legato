@@ -1,0 +1,41 @@
+{
+  "name": "@jianify/legato",
+  "version": "0.1.0",
+  "description": "Checkpointable TypeScript tasks with PostgreSQL ownership and Queue notifications",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "default": "./dist/schema.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test tests/*.test.ts"
+  },
+  "peerDependencies": {
+    "drizzle-orm": ">=0.45.4 <0.46"
+  },
+  "devDependencies": {
+    "drizzle-orm": "0.45.4",
+    "typescript": "5.9.3",
+    "tsx": "4.22.0",
+    "pg": "8.23.1",
+    "@types/pg": "8.15.6",
+    "@types/node": "24.19.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
