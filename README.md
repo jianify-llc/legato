@@ -14,4 +14,6 @@ The package has not yet been published. From a local checkout, use `pnpm install
 
 ## Local verification
 
+Follow the [Jianify development guide](https://github.com/jianify-llc/Jianify-LLC/blob/main/docs/engineering/development.md) for code review, testing and long-running handoffs.
+
 Run `pnpm check`, `pnpm build`, and `LEGATO_TEST_DATABASE_URL=<isolated-postgres-url> pnpm test`. Integration tests create and drop an isolated schema in that database; the configured account needs schema creation privileges. Without the URL, database tests are skipped. The tests use synthetic data and do not call paid providers.
