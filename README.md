@@ -12,7 +12,7 @@ Automatic continuation applies to Queue tasks. Inline tasks remain single invoca
 
 The package has not yet been published. From a local checkout, use `pnpm install`, `pnpm build`, and a workspace or local package dependency. It requires PostgreSQL and Drizzle ORM 0.45.x.
 
-`renewInTx` returns the confirmed lease expiry as a `Date`, or `null` when the caller no longer owns the task. Resumed execution gets its checkpoint when it claims the task.
+The runner renews a running slice every 60 seconds. The default lease lasts 180 seconds from acquisition or the last confirmed renewal, subject to the hard slice deadline. `renewInTx` returns the confirmed expiry as a `Date`, or `null` when the caller no longer owns the task. `assertOwnedInTx` throws on ownership loss and does not return task data. Resumed execution gets its checkpoint when it claims the task.
 
 ## Local verification
 

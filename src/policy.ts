@@ -1,8 +1,8 @@
 import type { TaskRecord } from "./types.js";
 export const SOFT_SLICE_MS = 12 * 60_000;
 export const HARD_SLICE_MS = 14 * 60_000;
-export const TASK_LEASE_MS = 60_000;
-export const TASK_RENEW_MS = 20_000;
+export const TASK_LEASE_MS = 180_000;
+export const TASK_RENEW_MS = 60_000;
 export const CHECKPOINT_MAX_BYTES = 1_048_576;
 export class TaskYield extends Error {
   constructor() {

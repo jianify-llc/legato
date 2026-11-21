@@ -176,15 +176,16 @@ export class TaskRepository<I extends TaskId = string> {
     id: I,
     owner: string,
     lock = false,
-  ): Promise<TaskRecord<I>> {
+  ): Promise<void> {
     const statement = lock
-      ? `WITH legato_locked AS MATERIALIZED (SELECT * FROM ${this.table} WHERE id=$1 FOR UPDATE),
+      ? `WITH legato_locked AS MATERIALIZED (
+           SELECT id,lease_id,status,lease_expires_at,started_at FROM ${this.table} WHERE id=$1 FOR UPDATE
+         ),
           legato_clock AS MATERIALIZED (SELECT clock_timestamp() AS now FROM legato_locked)
-         SELECT ${this.projection()} FROM legato_locked t WHERE ${this.owned().replaceAll("clock_timestamp()", "(SELECT now FROM legato_clock)")}`
-      : `SELECT ${this.projection()} FROM ${this.table} t WHERE ${this.owned()}`;
-    const row = await this.one(tx, statement, [id, owner]);
-    if (!row) throw new TaskLeaseLost();
-    return row;
+         SELECT 1 FROM legato_locked t WHERE ${this.owned().replaceAll("clock_timestamp()", "(SELECT now FROM legato_clock)")}`
+      : `SELECT 1 FROM ${this.table} t WHERE ${this.owned()}`;
+    const result = await tx.query(statement, [id, owner]);
+    if (!result.rows.length) throw new TaskLeaseLost();
   }
   async createInTx(tx: Sql, input: TaskInput<I>) {
     const columns = [

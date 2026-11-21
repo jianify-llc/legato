@@ -4,6 +4,7 @@ import {
   HARD_SLICE_MS,
   SOFT_SLICE_MS,
   SliceBudget,
+  TaskLeaseLost,
   TaskTimeout,
   TaskYield,
   taskMetrics,
@@ -175,7 +176,7 @@ test("finishing during renewal drains it without leaving an expiry timer", async
       let returned = false;
       const running = runSlice({
         startedAt: new Date(),
-        leaseExpiresAt: new Date(Date.now() + 60_000),
+        leaseExpiresAt: new Date(Date.now() + 180_000),
         renew: async () => {
           renewals++;
           return renewalGate;
@@ -200,7 +201,9 @@ test("finishing during renewal drains it without leaving an expiry timer", async
           return error;
         },
       );
-      t.mock.timers.tick(20_000);
+      t.mock.timers.tick(59_999);
+      assert.equal(renewals, 0);
+      t.mock.timers.tick(1);
       assert.equal(renewals, 1);
       finish();
       await new Promise((resolve) => setImmediate(resolve));
@@ -209,7 +212,7 @@ test("finishing during renewal drains it without leaving an expiry timer", async
         false,
         "Execution must await its in-flight renewal",
       );
-      renewed(new Date(Date.now() + 60_000));
+      renewed(new Date(Date.now() + 180_000));
       const result = await observed;
       if (outcome === "error")
         assert.equal((result as Error).message, "business");
@@ -222,5 +225,47 @@ test("finishing during renewal drains it without leaving an expiry timer", async
         "No expiry timer may abort the ended execution",
       );
     });
+  }
+});
+
+test("renewal errors retain the last confirmed deadline", async (t) => {
+  for (const recovers of [true, false]) {
+    await t.test(
+      recovers ? "the next heartbeat recovers" : "the lease expires",
+      async (t) => {
+        t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
+        let signal!: AbortSignal;
+        let renewals = 0;
+        const error = new Error("database unavailable");
+        const running = runSlice({
+          startedAt: new Date(),
+          leaseExpiresAt: new Date(Date.now() + 180_000),
+          renew: async () => {
+            renewals++;
+            if (!recovers || renewals !== 2) throw error;
+            return new Date(Date.now() + 180_000);
+          },
+          execute: async (budget) =>
+            new Promise((_, reject) => {
+              signal = budget.signal!;
+              signal.addEventListener("abort", () => reject(signal.reason), {
+                once: true,
+              });
+            }),
+          onTimeout: async () =>
+            assert.fail("Lease loss must precede the hard deadline"),
+        });
+        const rejected = assert.rejects(running, TaskLeaseLost);
+        for (let i = 0; i < (recovers ? 4 : 2); i++) {
+          t.mock.timers.tick(60_000);
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.equal(signal.aborted, false);
+        }
+        t.mock.timers.tick(59_999);
+        assert.equal(signal.aborted, false);
+        t.mock.timers.tick(1);
+        await rejected;
+      },
+    );
   }
 });

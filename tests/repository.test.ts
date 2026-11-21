@@ -9,7 +9,7 @@ import {
   TASK_FAILURE_BUDGET_BASELINE,
   TASK_RECOVERED,
 } from "../src/repository.js";
-import { HARD_SLICE_MS, taskMetrics } from "../src/policy.js";
+import { HARD_SLICE_MS, TaskLeaseLost, taskMetrics } from "../src/policy.js";
 
 const url = process.env.LEGATO_TEST_DATABASE_URL;
 const schema = `legato_test_${process.pid}`;
@@ -136,8 +136,12 @@ integration(
   "checkpoint CAS, transaction rollback, and more than four yields",
   async () => {
     const task = await create();
-    const first = await claim(task.id);
+    const first = (await repo.claimInTx(pool!, task.id))!;
     assert.ok(first.firstStartedAt);
+    assert.equal(
+      first.leaseExpiresAt!.getTime() - first.startedAt!.getTime(),
+      180_000,
+    );
     assert.ok(
       await repo.saveCheckpointInTx(pool!, task.id, first.leaseId!, null, {
         step: 1,
@@ -468,55 +472,66 @@ integration(
   },
 );
 
-integration(
-  "a pure row lock wait cannot authorize a write using the earlier clock",
-  async () => {
-    const task = await create();
-    const running = (await repo.claimInTx(pool!, task.id, { leaseMs: 250 }))!;
-    const blocker = await pool!.connect();
-    const writer = await pool!.connect();
-    try {
-      await blocker.query("BEGIN");
-      await blocker.query(
-        `SELECT id FROM "${schema}".queue_tasks WHERE id=$1 FOR UPDATE`,
-        [task.id],
-      );
-      const pid = (await writer.query("SELECT pg_backend_pid() AS id")).rows[0]
-        .id;
-      const pending = repo.completeInTx(writer, task.id, running.leaseId!, {
-        resultCode: "STALE",
-      });
-      let blocked = false;
-      for (let i = 0; i < 100; i++) {
-        const r = await query(
-          "SELECT cardinality(pg_blocking_pids($1))>0 AS blocked",
-          [pid],
+for (const action of ["completion", "ownership check"] as const) {
+  integration(
+    `a row lock wait cannot authorize ${action} using the earlier clock`,
+    async () => {
+      const task = await create();
+      const running = (await repo.claimInTx(pool!, task.id, { leaseMs: 250 }))!;
+      const blocker = await pool!.connect();
+      const writer = await pool!.connect();
+      try {
+        await blocker.query("BEGIN");
+        await blocker.query(
+          `SELECT id FROM "${schema}".queue_tasks WHERE id=$1 FOR UPDATE`,
+          [task.id],
         );
-        if (r.rows[0].blocked) {
-          blocked = true;
-          break;
+        const pid = (await writer.query("SELECT pg_backend_pid() AS id"))
+          .rows[0].id;
+        const pending =
+          action === "ownership check"
+            ? assert.rejects(
+                repo.assertOwnedInTx(writer, task.id, running.leaseId!, true),
+                TaskLeaseLost,
+              )
+            : repo.completeInTx(writer, task.id, running.leaseId!, {
+                resultCode: "STALE",
+              });
+        let blocked = false;
+        for (let i = 0; i < 100; i++) {
+          const r = await query(
+            "SELECT cardinality(pg_blocking_pids($1))>0 AS blocked",
+            [pid],
+          );
+          if (r.rows[0].blocked) {
+            blocked = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 5));
         }
-        await new Promise((resolve) => setTimeout(resolve, 5));
+        assert.equal(blocked, true);
+        await new Promise((resolve) =>
+          setTimeout(
+            resolve,
+            Math.max(0, running.leaseExpiresAt!.getTime() - Date.now() + 20),
+          ),
+        );
+        await blocker.query("COMMIT");
+        assert.equal(
+          await pending,
+          action === "ownership check" ? undefined : null,
+        );
+        const current = (await repo.readInTx(pool!, task.id))!;
+        assert.equal(current.status, "running");
+        assert.equal(current.finishedAt, null);
+      } finally {
+        await blocker.query("ROLLBACK");
+        blocker.release();
+        writer.release();
       }
-      assert.equal(blocked, true);
-      await new Promise((resolve) =>
-        setTimeout(
-          resolve,
-          Math.max(0, running.leaseExpiresAt!.getTime() - Date.now() + 20),
-        ),
-      );
-      await blocker.query("COMMIT");
-      assert.equal(await pending, null);
-      const current = (await repo.readInTx(pool!, task.id))!;
-      assert.equal(current.status, "running");
-      assert.equal(current.finishedAt, null);
-    } finally {
-      await blocker.query("ROLLBACK");
-      blocker.release();
-      writer.release();
-    }
-  },
-);
+    },
+  );
+}
 
 integration(
   "SQL and legacy JSON null checkpoints share the same empty-state contract",
@@ -594,6 +609,10 @@ integration(
       await repo.saveCheckpointInTx(pool!, task.id, running.leaseId!, null, {
         private: "synthetic-memory",
       }),
+    );
+    assert.equal(
+      await repo.assertOwnedInTx(pool!, task.id, running.leaseId!),
+      undefined,
     );
     const stopped = (await repo.cancelInTx(pool!, task.id, "ACCOUNT_DELETED"))!;
     assert.equal(stopped.executionState, null);
