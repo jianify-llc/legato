@@ -127,6 +127,14 @@ export class TaskRepository<I extends TaskId = string> {
     text: string,
     values: unknown[],
   ): Promise<TaskRecord<I> | null> {
+    const { rows: [row] } = await this.query(tx, text, values);
+    return row ? this.decode(row) : null;
+  }
+  private query<T extends Record<string, unknown>>(
+    tx: Sql,
+    text: string,
+    values: unknown[],
+  ) {
     // UPDATE may wait behind a SELECT FOR UPDATE without EPQ re-evaluating its volatile expressions.
     // The clock CTE depends on the row lock, so both qualification and time settlement use post-lock time.
     const statement = text.startsWith("UPDATE ")
@@ -134,8 +142,7 @@ export class TaskRepository<I extends TaskId = string> {
           legato_clock AS MATERIALIZED (SELECT clock_timestamp() AS now FROM legato_locked)
          ${text.replaceAll("clock_timestamp()", "(SELECT now FROM legato_clock)")}`
       : text;
-    const result = await tx.query(statement, values);
-    return result.rows[0] ? this.decode(result.rows[0]) : null;
+    return tx.query<T>(statement, values);
   }
   /** The database clock is checked in the UPDATE after any domain/row lock wait. */
   private owned(id = "$1", owner = "$2") {
@@ -246,15 +253,21 @@ export class TaskRepository<I extends TaskId = string> {
       ],
     );
   }
-  async renewInTx(tx: Sql, id: I, owner: string, leaseMs = TASK_LEASE_MS) {
+  async renewInTx(
+    tx: Sql,
+    id: I,
+    owner: string,
+    leaseMs = TASK_LEASE_MS,
+  ): Promise<Date | null> {
     if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0)
       throw new RangeError("Invalid task lease duration");
-    return this.one(
+    const { rows: [row] } = await this.query<{ lease_expires_at: Date | string }>(
       tx,
       `UPDATE ${this.table} AS t SET lease_expires_at=least(clock_timestamp()+$3*interval '1 millisecond',started_at+${HARD_SLICE_MS}*interval '1 millisecond'),updated_at=clock_timestamp()
-      WHERE ${this.owned()} RETURNING ${this.projection()}`,
+      WHERE ${this.owned()} RETURNING t.lease_expires_at`,
       [id, owner, leaseMs],
     );
+    return row ? new Date(row.lease_expires_at) : null;
   }
   async saveCheckpointInTx(
     tx: Sql,

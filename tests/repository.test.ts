@@ -9,7 +9,7 @@ import {
   TASK_FAILURE_BUDGET_BASELINE,
   TASK_RECOVERED,
 } from "../src/repository.js";
-import { taskMetrics } from "../src/policy.js";
+import { HARD_SLICE_MS, taskMetrics } from "../src/policy.js";
 
 const url = process.env.LEGATO_TEST_DATABASE_URL;
 const schema = `legato_test_${process.pid}`;
@@ -143,6 +143,17 @@ integration(
         step: 1,
       }),
     );
+    const expiresAt = await repo.renewInTx(
+      pool!,
+      task.id,
+      first.leaseId!,
+      HARD_SLICE_MS,
+    );
+    assert.ok(expiresAt instanceof Date);
+    assert.equal(
+      expiresAt.getTime(),
+      first.startedAt!.getTime() + HARD_SLICE_MS,
+    );
     assert.equal(
       await repo.saveCheckpointInTx(pool!, task.id, first.leaseId!, null, {
         step: 99,
@@ -196,6 +207,7 @@ integration(
     for (let i = 0; i < 5; i++) {
       const next = await claim(task.id);
       assert.equal(next.failureCount, 0);
+      assert.deepEqual(next.executionState, { step: i + 2 });
       assert.ok(
         await repo.yieldInTx(pool!, task.id, next.leaseId!, { step: i + 3 }),
       );
@@ -258,6 +270,7 @@ integration(
       `UPDATE "${schema}".queue_tasks SET started_at=clock_timestamp()-interval '20 minutes', lease_expires_at=clock_timestamp()-interval '6 minutes' WHERE id=$1`,
       [task.id],
     );
+    assert.equal(await repo.renewInTx(pool!, task.id, old.leaseId!), null);
     assert.equal(
       await repo.saveCheckpointInTx(pool!, task.id, old.leaseId!, null, {
         stale: true,
@@ -293,6 +306,8 @@ integration(
     );
     const current = await claim(task.id);
     assert.equal(current.runAttempts, 2);
+    assert.equal(await repo.renewInTx(pool!, task.id, old.leaseId!), null);
+    assert.ok(await repo.renewInTx(pool!, task.id, current.leaseId!));
     assert.equal(
       await repo.saveCheckpointInTx(pool!, task.id, old.leaseId!, null, {
         stale: true,

@@ -12,6 +12,8 @@ Automatic continuation applies to Queue tasks. Inline tasks remain single invoca
 
 The package has not yet been published. From a local checkout, use `pnpm install`, `pnpm build`, and a workspace or local package dependency. It requires PostgreSQL and Drizzle ORM 0.45.x.
 
+`renewInTx` returns the confirmed lease expiry as a `Date`, or `null` when the caller no longer owns the task. Resumed execution gets its checkpoint when it claims the task.
+
 ## Local verification
 
 Run `pnpm check`, `pnpm build`, and `LEGATO_TEST_DATABASE_URL=<isolated-postgres-url> pnpm test`. Integration tests create and drop an isolated schema in that database; the configured account needs schema creation privileges. Without the URL, database tests are skipped. The tests use synthetic data and do not call paid providers.
