@@ -1,6 +1,5 @@
 /** Managed heartbeat and hard revocation. Domain code still chooses and atomically saves safe checkpoints. */
 import {
-  HARD_SLICE_MS,
   SliceBudget,
   TASK_RENEW_MS,
   TaskLeaseLost,
@@ -82,27 +81,29 @@ export async function runSlice<T>(options: SliceOptions<T>): Promise<T> {
     timingOut ??= Promise.resolve().then(options.onTimeout);
     return timingOut;
   };
-  const timeout = new Promise<never>((_, reject) => {
-    hardTimer = setTimeout(
-      () => {
-        const error = new TaskTimeout();
-        controller.abort(error);
-        // Revocation uses an independent bounded database operation, never the aborted model call's connection.
-        settleTimeout().then(() => reject(error), reject);
-      },
-      Math.max(0, options.startedAt.getTime() + HARD_SLICE_MS - Date.now()),
-    );
-  });
   try {
     budget.assertActive();
     if (Date.now() >= expiresAt) {
       lose();
       signal.throwIfAborted();
     }
+    // Arm the hard timer only after the startup checks.
+    const timeout = new Promise<never>((_, reject) => {
+      hardTimer = setTimeout(
+        () => {
+          const error = new TaskTimeout();
+          controller.abort(error);
+          // Revocation uses an independent database operation, never the aborted handler's connection.
+          settleTimeout().then(() => reject(error), reject);
+        },
+        Math.max(0, budget.hardDeadlineAt - Date.now()),
+      );
+    });
     scheduleExpiry();
     scheduleRenew();
     // All persistence methods fence the lease in PostgreSQL. Abort cannot kill an uncooperative HTTP promise.
-    const result = await Promise.race([options.execute(budget), timeout]);
+    // Capture a synchronous handler throw in the same race as the hard timer.
+    const result = await Promise.race([(async () => options.execute(budget))(), timeout]);
     // A handler can swallow cancellation, or block the event loop past the timer. Neither extends the slice.
     if (Date.now() >= budget.hardDeadlineAt) throw new TaskTimeout();
     return result;
