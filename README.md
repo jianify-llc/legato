@@ -4,9 +4,15 @@ Legato provides checkpointable task execution using PostgreSQL as the owner of l
 
 Each claim is a slice (`run_attempts`); voluntary yields do not spend the failure budget. The soft deadline is 12 minutes and the hard deadline is 14 minutes. `execution_ms` sums settled owned slices; task elapsed time derives from creation to finish, and initial queue time from creation to first start. A legacy unknown execution duration stays null. `acceptLateSuccessInTx` is reserved for an independently verified external receipt and cannot replace the checkpoint.
 
-The runner signals cancellation but cannot forcibly stop arbitrary JavaScript or external work. Database lease and deadline checks fence late ordinary writes. Domain handlers must cooperate with the budget and pick safe continuation boundaries. A Standard fallback should only begin when its timeout and closing reserve fit in the remaining soft budget.
+The runner signals cancellation but cannot forcibly stop arbitrary JavaScript or external work. Database lease and deadline checks fence late ordinary writes. `renewInTx` returns the new lease expiry or `null` when the current owner cannot renew. Domain handlers must cooperate with the budget and pick safe continuation boundaries. A Standard fallback should only begin when its timeout and closing reserve fit in the remaining soft budget.
 
 Automatic continuation applies to Queue tasks. Inline tasks remain single invocations with caller-owned receipt recovery; yielding an inline task is rejected instead of leaving an unconsumable pending task.
+
+For an ID-only Queue notification, `claimQueuedInTx` takes the task types available to the consumer and each type's failure limit. It checks the locked row and database time before granting a lease. An unsupported queued type can be reported to the caller without locking the task or charging an attempt.
+
+`reserveDispatchByTypeInTx` applies the configured budget for the locked task's type and returns the previous status with the reservation. The caller sends the notification after confirming the reservation. The fixed-budget `reserveDispatchInTx` uses the same write.
+
+`yieldInTx` keeps the current checkpoint when `next` is undefined and clears it when `next` is null. An optional `minimumDelayMs` schedules the next slice no earlier than the requested delay after the Task row lock is acquired. A later absolute `nextRunAt` still takes precedence.
 
 ## Installation
 

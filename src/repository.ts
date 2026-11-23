@@ -54,6 +54,7 @@ const names = [
   "attention_entered_at",
   "retry_of_task_id",
 ];
+const leaseTimes = "id, lease_expires_at, started_at";
 const camel = (name: string) =>
   name.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 const numeric = new Set([
@@ -127,20 +128,37 @@ export class TaskRepository<I extends TaskId = string> {
     text: string,
     values: unknown[],
   ): Promise<TaskRecord<I> | null> {
-    // UPDATE may wait behind a SELECT FOR UPDATE without EPQ re-evaluating its volatile expressions.
-    // The clock CTE depends on the row lock, so both qualification and time settlement use post-lock time.
-    const statement = text.startsWith("UPDATE ")
-      ? `WITH legato_locked AS MATERIALIZED (SELECT id FROM ${this.table} WHERE id=$1 FOR UPDATE),
-          legato_clock AS MATERIALIZED (SELECT clock_timestamp() AS now FROM legato_locked)
-         ${text.replaceAll("clock_timestamp()", "(SELECT now FROM legato_clock)")}`
-      : text;
-    const result = await tx.query(statement, values);
+    const result = await tx.query(text, values);
     return result.rows[0] ? this.decode(result.rows[0]) : null;
   }
-  /** The database clock is checked in the UPDATE after any domain/row lock wait. */
-  private owned(id = "$1", owner = "$2") {
-    return `t.id=${id} AND t.lease_id=${owner} AND t.status='running' AND t.lease_expires_at>clock_timestamp()
-      AND t.started_at+${HARD_SLICE_MS}*interval '1 millisecond'>clock_timestamp()`;
+  private afterLockSql(text: string, columns: string, candidate = "t.id=$1") {
+    // A write can still see its old snapshot after waiting. Qualify on the row
+    // returned by the lock and evaluate deadlines with the post-lock clock.
+    return `WITH legato_locked AS MATERIALIZED (
+       SELECT ${columns} FROM ${this.table} AS t WHERE ${candidate} FOR NO KEY UPDATE
+     ), legato_clock AS MATERIALIZED (
+       SELECT clock_timestamp() AS now FROM legato_locked
+     )
+     ${text.replaceAll("clock_timestamp()", "(SELECT now FROM legato_clock)")}`;
+  }
+  private oneAfterLock(
+    tx: Sql,
+    text: string,
+    values: unknown[],
+    columns = "id",
+    candidate?: string,
+  ) {
+    return this.one(tx, this.afterLockSql(text, columns, candidate), values);
+  }
+  private runningOwner() {
+    return "t.id=$1 AND t.status='running' AND t.lease_id=$2";
+  }
+  private unexpiredLease(row: string) {
+    return `${row}.lease_expires_at>clock_timestamp()
+      AND ${row}.started_at+${HARD_SLICE_MS}*interval '1 millisecond'>clock_timestamp()`;
+  }
+  private lockedRowWhere(predicate = this.unexpiredLease("locked")) {
+    return `t.id=(SELECT locked.id FROM legato_locked AS locked WHERE ${predicate})`;
   }
   private elapsed() {
     // NULL is a legacy unknown duration and remains unknown after later slices.
@@ -171,10 +189,13 @@ export class TaskRepository<I extends TaskId = string> {
     lock = false,
   ): Promise<TaskRecord<I>> {
     const statement = lock
-      ? `WITH legato_locked AS MATERIALIZED (SELECT * FROM ${this.table} WHERE id=$1 FOR UPDATE),
-          legato_clock AS MATERIALIZED (SELECT clock_timestamp() AS now FROM legato_locked)
-         SELECT ${this.projection()} FROM legato_locked t WHERE ${this.owned().replaceAll("clock_timestamp()", "(SELECT now FROM legato_clock)")}`
-      : `SELECT ${this.projection()} FROM ${this.table} t WHERE ${this.owned()}`;
+      ? `WITH legato_locked AS MATERIALIZED (
+           SELECT t.* FROM ${this.table} t WHERE ${this.runningOwner()} FOR UPDATE
+         ), legato_clock AS MATERIALIZED (SELECT clock_timestamp() AS now FROM legato_locked)
+         SELECT ${this.projection()} FROM legato_locked t
+         WHERE ${this.unexpiredLease("t").replaceAll("clock_timestamp()", "(SELECT now FROM legato_clock)")}`
+      : `SELECT ${this.projection()} FROM ${this.table} t
+         WHERE ${this.runningOwner()} AND ${this.unexpiredLease("t")}`;
     const row = await this.one(tx, statement, [id, owner]);
     if (!row) throw new TaskLeaseLost();
     return row;
@@ -222,39 +243,99 @@ export class TaskRepository<I extends TaskId = string> {
       values,
     );
   }
-  async claimInTx(tx: Sql, id: I, options: ClaimOptions = {}) {
-    const leaseMs = options.leaseMs ?? TASK_LEASE_MS;
+  private claimParameters(id: I, leaseMs: number) {
     if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0)
       throw new RangeError("Invalid task lease duration");
-    return this.one(
+    return [id, crypto.randomUUID(), leaseMs];
+  }
+  private claimUpdate(now = "clock_timestamp()") {
+    return `UPDATE ${this.table} AS t SET status='running',lease_id=$2,lease_expires_at=least(${now}+$3*interval '1 millisecond',${now}+${HARD_SLICE_MS}*interval '1 millisecond'),
+      first_started_at=CASE WHEN run_attempts=0 THEN ${now} ELSE first_started_at END,
+      started_at=${now},run_attempts=run_attempts+1,dispatch_failures=0,next_dispatch_at=NULL,updated_at=${now}`;
+  }
+  private claimTimeCondition(row: string, now = "clock_timestamp()") {
+    return `${row}.next_run_at<=${now} AND (${row}.expires_at IS NULL OR ${row}.expires_at>${now})`;
+  }
+  async claimInTx(tx: Sql, id: I, options: ClaimOptions = {}) {
+    const candidate = `t.id=$1 AND t.status=ANY($4::text[]) AND t.lease_id IS NULL
+      AND ($5::text IS NULL OR t.type=$5) AND ($6::text IS NULL OR t.execution_mode=$6)`;
+    const eligible = `($7::integer IS NULL OR ${failureCountSql("locked")}<$7)
+      AND ${this.claimTimeCondition("locked")}`;
+    return this.oneAfterLock(
       tx,
-      `UPDATE ${this.table} AS t SET status='running',lease_id=$2,lease_expires_at=least(clock_timestamp()+$3*interval '1 millisecond',clock_timestamp()+${HARD_SLICE_MS}*interval '1 millisecond'),
-      first_started_at=CASE WHEN run_attempts=0 THEN clock_timestamp() ELSE first_started_at END,
-      started_at=clock_timestamp(),run_attempts=run_attempts+1,dispatch_failures=0,next_dispatch_at=NULL,updated_at=clock_timestamp()
-      WHERE id=$1 AND status=ANY($4::text[]) AND lease_id IS NULL AND next_run_at<=clock_timestamp()
-      AND ($5::text IS NULL OR type=$5) AND ($6::text IS NULL OR execution_mode=$6)
-      AND ($7::integer IS NULL OR ${failureCountSql()}<$7)
-      AND (expires_at IS NULL OR expires_at>clock_timestamp()) RETURNING ${this.projection()}`,
+      `${this.claimUpdate()} WHERE ${this.lockedRowWhere(eligible)} RETURNING ${this.projection()}`,
       [
-        id,
-        crypto.randomUUID(),
-        leaseMs,
+        ...this.claimParameters(id, options.leaseMs ?? TASK_LEASE_MS),
         options.statuses ?? ["pending", "queued", "retry_wait"],
         options.type ?? null,
         options.executionMode ?? null,
         options.limit ?? null,
       ],
+      "id, fail_reasons, next_run_at, expires_at",
+      candidate,
     );
   }
-  async renewInTx(tx: Sql, id: I, owner: string, leaseMs = TASK_LEASE_MS) {
+  /** Claim an ID-only queue notification using the deployed handlers' type budgets. */
+  async claimQueuedInTx(
+    tx: Sql,
+    id: I,
+    typeLimits: ReadonlyMap<string, number | null>,
+    leaseMs = TASK_LEASE_MS,
+  ): Promise<{ task: TaskRecord<I> | null; unsupportedType: string | null }> {
+    const policies = [...typeLimits];
+    const now = "(SELECT now FROM legato_clock)";
+    const update = `${this.claimUpdate(now)}
+      FROM legato_locked AS locked
+      WHERE t.id=locked.id AND ${this.claimTimeCondition("locked", now)}
+        AND (locked.failure_limit IS NULL OR ${failureCountSql("locked")}<locked.failure_limit)
+      RETURNING ${this.projection()}`;
+    // Only eligible routes lock the task. This update leaves foreign-key references usable.
+    // The diagnostic read never locks the task or consumes budget.
+    const result = await tx.query(
+      `WITH claim_types AS (
+         SELECT * FROM unnest($4::text[], $5::integer[]) AS policy(type, failure_limit)
+       ), legato_locked AS MATERIALIZED (
+         SELECT t.id, t.next_run_at, t.expires_at, t.fail_reasons, policy.failure_limit FROM ${this.table} AS t
+         JOIN claim_types AS policy ON policy.type=t.type
+         WHERE t.id=$1 AND t.status='queued' AND t.execution_mode='queue' AND t.lease_id IS NULL
+           AND (t.expires_at IS NULL OR t.expires_at>statement_timestamp())
+         FOR NO KEY UPDATE OF t
+       ), legato_clock AS MATERIALIZED (
+         SELECT clock_timestamp() AS now FROM legato_locked
+       ), claimed AS (${update}), unsupported AS (
+         SELECT t.type FROM ${this.table} AS t
+         WHERE NOT EXISTS (SELECT 1 FROM claimed) AND t.id=$1 AND t.status='queued'
+           AND t.execution_mode='queue'
+           AND (t.expires_at IS NULL OR t.expires_at>statement_timestamp())
+           AND NOT EXISTS (SELECT 1 FROM claim_types WHERE claim_types.type=t.type)
+       )
+       SELECT claimed.*, unsupported.type AS unsupported_type
+       FROM (VALUES (1)) AS request(id)
+       LEFT JOIN claimed ON true LEFT JOIN unsupported ON true`,
+      [
+        ...this.claimParameters(id, leaseMs),
+        policies.map(([type]) => type),
+        policies.map(([, limit]) => limit),
+      ],
+    );
+    const { unsupported_type, ...row } = result.rows[0] ?? {};
+    return {
+      task: row.id == null ? null : this.decode(row),
+      unsupportedType: typeof unsupported_type === "string" ? unsupported_type : null,
+    };
+  }
+  async renewInTx(tx: Sql, id: I, owner: string, leaseMs = TASK_LEASE_MS): Promise<Date | null> {
     if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0)
       throw new RangeError("Invalid task lease duration");
-    return this.one(
-      tx,
-      `UPDATE ${this.table} AS t SET lease_expires_at=least(clock_timestamp()+$3*interval '1 millisecond',started_at+${HARD_SLICE_MS}*interval '1 millisecond'),updated_at=clock_timestamp()
-      WHERE ${this.owned()} RETURNING ${this.projection()}`,
+    const update = `UPDATE ${this.table} AS t
+      SET lease_expires_at=least(clock_timestamp()+$3*interval '1 millisecond',started_at+${HARD_SLICE_MS}*interval '1 millisecond'),
+        updated_at=clock_timestamp()
+      WHERE ${this.lockedRowWhere()} RETURNING t.lease_expires_at`;
+    const { rows: [row] } = await tx.query<{ lease_expires_at: Date | string }>(
+      this.afterLockSql(update, leaseTimes, this.runningOwner()),
       [id, owner, leaseMs],
     );
+    return row ? new Date(row.lease_expires_at) : null;
   }
   async saveCheckpointInTx(
     tx: Sql,
@@ -263,44 +344,62 @@ export class TaskRepository<I extends TaskId = string> {
     previous: Json | null,
     next: Json,
   ) {
-    return this.one(
+    const sameCheckpoint = "NULLIF(locked.execution_state,'null'::jsonb) IS NOT DISTINCT FROM NULLIF($3::jsonb,'null'::jsonb)";
+    return this.oneAfterLock(
       tx,
       `UPDATE ${this.table} AS t SET execution_state=$4::jsonb,updated_at=clock_timestamp()
-      WHERE ${this.owned()} AND NULLIF(execution_state,'null'::jsonb) IS NOT DISTINCT FROM NULLIF($3::jsonb,'null'::jsonb) RETURNING ${this.projection()}`,
+      WHERE ${this.lockedRowWhere(`${this.unexpiredLease("locked")} AND ${sameCheckpoint}`)} RETURNING ${this.projection()}`,
       [id, owner, checkpoint(previous), checkpoint(next)],
+      `${leaseTimes}, execution_state`,
+      this.runningOwner(),
     );
   }
   async yieldInTx(
     tx: Sql,
     id: I,
     owner: string,
-    next: Json | null,
+    next: Json | null | undefined,
     nextRunAt?: Date,
-    summary?: Pick<Completion, "result" | "resultCode">,
+    options?: Partial<Pick<Completion, "result" | "resultCode">> & {
+      minimumDelayMs?: number;
+      type?: string;
+    },
   ) {
-    return this.one(
+    const delay = options?.minimumDelayMs;
+    if (delay !== undefined && (!Number.isSafeInteger(delay) || delay < 0))
+      throw new RangeError("Minimum yield delay must be a non-negative integer");
+    const candidate = `${this.runningOwner()} AND t.execution_mode='queue'
+      AND ($10::text IS NULL OR t.type=$10)`;
+    return this.oneAfterLock(
       tx,
-      `UPDATE ${this.table} AS t SET status='pending',execution_state=$3::jsonb,next_run_at=COALESCE($4::timestamptz,clock_timestamp()),
+      `UPDATE ${this.table} AS t SET status='pending',execution_state=CASE WHEN $8 THEN $3::jsonb ELSE t.execution_state END,
+      next_run_at=greatest(COALESCE($4::timestamptz,clock_timestamp()),clock_timestamp()+$9::bigint*interval '1 millisecond'),
       execution_ms=${this.elapsed()},lease_id=NULL,lease_expires_at=NULL,started_at=NULL,next_dispatch_at=NULL,result_code=$5,result=CASE WHEN $6 THEN $7::jsonb ELSE result END,updated_at=clock_timestamp()
-      WHERE ${this.owned()} AND execution_mode='queue' RETURNING ${this.projection()}`,
+      WHERE ${this.lockedRowWhere()}
+      RETURNING ${this.projection()}`,
       [
         id,
         owner,
-        checkpoint(next),
+        checkpoint(next ?? null),
         nextRunAt ?? null,
-        summary?.resultCode ?? "TASK_YIELDED",
-        summary?.result !== undefined,
-        JSON.stringify(summary?.result ?? null),
+        options?.resultCode ?? "TASK_YIELDED",
+        options?.result !== undefined,
+        JSON.stringify(options?.result ?? null),
+        next !== undefined,
+        delay ?? null,
+        options?.type ?? null,
       ],
+      leaseTimes,
+      candidate,
     );
   }
   async completeInTx(tx: Sql, id: I, owner: string, completion: Completion) {
-    return this.one(
+    return this.oneAfterLock(
       tx,
       `UPDATE ${this.table} AS t SET status='succeeded',result=$3::jsonb,result_code=$4,
       execution_state=CASE WHEN $5 THEN $6::jsonb ELSE execution_state END,
       execution_ms=${this.elapsed()},lease_id=NULL,lease_expires_at=NULL,started_at=NULL,next_dispatch_at=NULL,finished_at=clock_timestamp(),updated_at=clock_timestamp()
-      WHERE ${this.owned()} RETURNING ${this.projection()}`,
+      WHERE ${this.lockedRowWhere()} RETURNING ${this.projection()}`,
       [
         id,
         owner,
@@ -309,6 +408,8 @@ export class TaskRepository<I extends TaskId = string> {
         completion.executionState !== undefined,
         checkpoint(completion.executionState ?? null),
       ],
+      leaseTimes,
+      this.runningOwner(),
     );
   }
   /** Empty/no-op batches finish without pretending a worker/model slice was executed. */
@@ -329,12 +430,35 @@ export class TaskRepository<I extends TaskId = string> {
   ) {
     if ("executionState" in completion)
       throw new TypeError("Late success cannot replace a checkpoint");
-    return this.one(
+    return this.oneAfterLock(
       tx,
       `UPDATE ${this.table} AS t SET status='succeeded',result=$2::jsonb,result_code=$3,
       execution_ms=${this.elapsed()},lease_id=NULL,lease_expires_at=NULL,started_at=NULL,next_dispatch_at=NULL,finished_at=clock_timestamp(),updated_at=clock_timestamp()
       WHERE id=$1 AND status<>'succeeded' RETURNING ${this.projection()}`,
       [id, JSON.stringify(completion.result ?? null), completion.resultCode],
+    );
+  }
+  /** A caller-reviewed manual result may replace its checkpoint in the review transaction. */
+  async confirmReviewedSuccessInTx(
+    tx: Sql,
+    id: I,
+    runAttempts: number,
+    completion: Completion & { executionState: NonNullable<Completion["executionState"]> },
+  ) {
+    return this.one(
+      tx,
+      `UPDATE ${this.table} AS t SET status='succeeded',result=$3::jsonb,result_code=$4,
+      execution_state=$5::jsonb,lease_expires_at=NULL,started_at=NULL,next_dispatch_at=NULL,
+      finished_at=clock_timestamp(),updated_at=clock_timestamp()
+      WHERE id=$1 AND run_attempts=$2 AND status='manual' AND lease_id IS NULL
+      RETURNING ${this.projection()}`,
+      [
+        id,
+        runAttempts,
+        JSON.stringify(completion.result ?? null),
+        completion.resultCode,
+        checkpoint(completion.executionState),
+      ],
     );
   }
   private async fail(
@@ -344,21 +468,25 @@ export class TaskRepository<I extends TaskId = string> {
     failure: Failure,
     policy: RetryPolicy,
     expired: boolean,
-    completion?: Pick<Completion, "result">,
+    completion?: Pick<Completion, "result"> & { expectedType?: string },
   ) {
     if (
       !policy.delays.length ||
       policy.delays.some((d) => !Number.isFinite(d) || d < 0)
     )
       throw new RangeError("Invalid retry delays");
-    const predicate = expired
-      ? `id=$1 AND status='running' AND (lease_expires_at<=clock_timestamp() OR started_at+${HARD_SLICE_MS}*interval '1 millisecond'<=clock_timestamp())`
-      : this.owned();
+    const ownerCandidate = expired
+      ? "t.id=$1 AND t.status='running' AND ($2::uuid IS NULL OR t.lease_id=$2)"
+      : this.runningOwner();
+    const candidate = `${ownerCandidate} AND ($13::text IS NULL OR t.type=$13)`;
+    const eligible = expired
+      ? `(locked.lease_expires_at<=clock_timestamp() OR locked.started_at+${HARD_SLICE_MS}*interval '1 millisecond'<=clock_timestamp())`
+      : this.unexpiredLease("locked");
     const count = `${failureCountSql()}+1`;
     const again = `$4 AND execution_mode='queue' AND ($5::integer IS NULL OR ${count}<$5)`;
     const next = `greatest(clock_timestamp()+($6::double precision[])[least(array_length($6::double precision[],1),${count})]*interval '1 minute',COALESCE($7::timestamptz,clock_timestamp()))`;
     const retry = `${again} AND (expires_at IS NULL OR ${next}<expires_at)`;
-    return this.one(
+    return this.oneAfterLock(
       tx,
       `UPDATE ${this.table} AS t SET
       status=CASE WHEN $8 THEN 'manual' WHEN ${retry} THEN 'retry_wait' ELSE 'failed' END,
@@ -368,7 +496,7 @@ export class TaskRepository<I extends TaskId = string> {
       last_failed_run_attempt=run_attempts,last_failed_at=clock_timestamp(),result_code=$3,
       result=CASE WHEN $11 THEN $12::jsonb ELSE result END,
       execution_ms=${this.elapsed()},lease_id=NULL,lease_expires_at=NULL,started_at=NULL,next_dispatch_at=NULL,updated_at=clock_timestamp()
-      WHERE ${predicate} ${expired ? "AND ($2::uuid IS NULL OR lease_id=$2)" : ""} RETURNING ${this.projection()}`,
+      WHERE ${this.lockedRowWhere(eligible)} RETURNING ${this.projection()}`,
       [
         id,
         owner,
@@ -382,7 +510,10 @@ export class TaskRepository<I extends TaskId = string> {
         JSON.stringify(failure.diagnostics ?? []),
         completion?.result !== undefined,
         JSON.stringify(completion?.result ?? null),
+        completion?.expectedType ?? null,
       ],
+      leaseTimes,
+      candidate,
     );
   }
   failInTx(
@@ -391,7 +522,7 @@ export class TaskRepository<I extends TaskId = string> {
     owner: string,
     failure: Failure,
     policy: RetryPolicy,
-    completion?: Pick<Completion, "result">,
+    completion?: Pick<Completion, "result"> & { expectedType?: string },
   ) {
     return this.fail(tx, id, owner, failure, policy, false, completion);
   }
@@ -405,15 +536,48 @@ export class TaskRepository<I extends TaskId = string> {
     return this.fail(tx, id, owner ?? null, failure, policy, true);
   }
   async reserveDispatchInTx(tx: Sql, id: I, limit?: number | null) {
-    return this.one(
-      tx,
-      `UPDATE ${this.table} AS t SET status='queued',dispatch_attempts=dispatch_attempts+1,dispatch_failures=dispatch_failures+1,
-      last_dispatch_attempt_at=date_trunc('milliseconds',clock_timestamp()),next_dispatch_at=clock_timestamp()+interval '1 minute',updated_at=clock_timestamp()
-      WHERE id=$1 AND execution_mode='queue' AND status IN ('pending','queued','retry_wait') AND lease_id IS NULL AND next_run_at<=clock_timestamp()
-      AND (next_dispatch_at IS NULL OR next_dispatch_at<=clock_timestamp()) AND (expires_at IS NULL OR expires_at>clock_timestamp())
-      AND ($2::integer IS NULL OR ${failureCountSql()}<$2) RETURNING ${this.projection()}`,
-      [id, limit ?? null],
+    const reservation = await this.reserveDispatchByTypeInTx(tx, id, new Map(), limit ?? null);
+    return reservation?.task ?? null;
+  }
+  /** Reserve a notification using the locked task's type and return its previous status. */
+  async reserveDispatchByTypeInTx(
+    tx: Sql,
+    id: I,
+    typeLimits: ReadonlyMap<string, number | null>,
+    defaultLimit: number | null,
+  ): Promise<{ task: TaskRecord<I>; previousStatus: TaskStatus } | null> {
+    const policies = [...typeLimits];
+    const { rows: [row] } = await tx.query<{ previous_status: TaskStatus } & Record<string, unknown>>(
+      `WITH legato_locked AS MATERIALIZED (
+         SELECT t.id, t.type, t.status, t.next_run_at, t.next_dispatch_at, t.expires_at, t.fail_reasons
+         FROM ${this.table} AS t
+         WHERE t.id=$1 AND t.execution_mode='queue' AND t.status IN ('pending','queued','retry_wait')
+           AND t.lease_id IS NULL AND (t.expires_at IS NULL OR t.expires_at>statement_timestamp())
+         FOR NO KEY UPDATE OF t
+       ), legato_dispatch AS MATERIALIZED (
+         SELECT locked.*, clock_timestamp() AS now,
+           CASE WHEN policy.type IS NULL THEN $2::integer ELSE policy.failure_limit END AS failure_limit
+         FROM legato_locked AS locked
+         LEFT JOIN unnest($3::text[], $4::integer[]) AS policy(type, failure_limit) ON policy.type=locked.type
+       )
+       UPDATE ${this.table} AS t SET status='queued',dispatch_attempts=t.dispatch_attempts+1,
+         dispatch_failures=t.dispatch_failures+1,last_dispatch_attempt_at=date_trunc('milliseconds',candidate.now),
+         next_dispatch_at=candidate.now+interval '1 minute',updated_at=candidate.now
+       FROM legato_dispatch AS candidate
+       WHERE t.id=candidate.id AND ${this.claimTimeCondition("candidate","candidate.now")}
+         AND (candidate.next_dispatch_at IS NULL OR candidate.next_dispatch_at<=candidate.now)
+         AND (candidate.failure_limit IS NULL OR ${failureCountSql("candidate")}<candidate.failure_limit)
+       RETURNING ${this.projection()},candidate.status AS previous_status`,
+      [
+        id,
+        defaultLimit,
+        policies.map(([type]) => type),
+        policies.map(([, limit]) => limit),
+      ],
     );
+    if (!row) return null;
+    const { previous_status, ...task } = row;
+    return { task: this.decode(task), previousStatus: previous_status };
   }
   async acknowledgeDispatchInTx(tx: Sql, id: I, reservedAt: Date) {
     return this.one(
@@ -464,20 +628,23 @@ export class TaskRepository<I extends TaskId = string> {
   }
   /** A stopped deployment may clear private checkpoints only after all confirmed execution rights have expired. */
   async stopForMigrationInTx(tx: Sql, id: I) {
-    return this.one(
+    const expired = `locked.lease_id IS NULL OR locked.lease_expires_at<=clock_timestamp()
+      OR locked.started_at+${HARD_SLICE_MS}*interval '1 millisecond'<=clock_timestamp()`;
+    return this.oneAfterLock(
       tx,
       `UPDATE ${this.table} AS t SET execution_state=NULL,execution_ms=${this.elapsed()},
       status=CASE WHEN status IN ('succeeded','failed') THEN status ELSE 'manual' END,
       result_code=CASE WHEN status IN ('succeeded','failed') THEN result_code ELSE 'TASK_MIGRATION_PAUSED' END,
       lease_id=NULL,lease_expires_at=NULL,started_at=NULL,next_dispatch_at=NULL,updated_at=clock_timestamp()
-      WHERE id=$1 AND (lease_id IS NULL OR lease_expires_at<=clock_timestamp() OR started_at+${HARD_SLICE_MS}*interval '1 millisecond'<=clock_timestamp())
+      WHERE ${this.lockedRowWhere(expired)}
       RETURNING ${this.projection()}`,
       [id],
+      `${leaseTimes}, lease_id`,
     );
   }
   /** Domain-authorized cancellation (for example account deletion), not ordinary executor recovery. */
   async cancelInTx(tx: Sql, id: I, resultCode: string) {
-    return this.one(
+    return this.oneAfterLock(
       tx,
       `UPDATE ${this.table} AS t SET execution_state=NULL,execution_ms=${this.elapsed()},
       status=CASE WHEN status='succeeded' THEN status ELSE 'failed' END,
