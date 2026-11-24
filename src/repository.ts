@@ -21,6 +21,10 @@ import {
 
 export const TASK_RECOVERED = "TASK_RECOVERED";
 export const TASK_FAILURE_BUDGET_BASELINE = "TASK_FAILURE_BUDGET_BASELINE";
+type FailureCompletion = Pick<Completion, "result"> & {
+  expectedType?: string;
+  checkpoint?: { previous: Json | null; next: Json };
+};
 const names = [
   "id",
   "request_key",
@@ -55,6 +59,8 @@ const names = [
   "retry_of_task_id",
 ];
 const leaseTimes = "id, lease_expires_at, started_at";
+const checkpointMatches = (parameter: string) =>
+  `NULLIF(locked.execution_state,'null'::jsonb) IS NOT DISTINCT FROM NULLIF(${parameter}::jsonb,'null'::jsonb)`;
 const camel = (name: string) =>
   name.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 const numeric = new Set([
@@ -344,11 +350,10 @@ export class TaskRepository<I extends TaskId = string> {
     previous: Json | null,
     next: Json,
   ) {
-    const sameCheckpoint = "NULLIF(locked.execution_state,'null'::jsonb) IS NOT DISTINCT FROM NULLIF($3::jsonb,'null'::jsonb)";
     return this.oneAfterLock(
       tx,
       `UPDATE ${this.table} AS t SET execution_state=$4::jsonb,updated_at=clock_timestamp()
-      WHERE ${this.lockedRowWhere(`${this.unexpiredLease("locked")} AND ${sameCheckpoint}`)} RETURNING ${this.projection()}`,
+      WHERE ${this.lockedRowWhere(`${this.unexpiredLease("locked")} AND ${checkpointMatches("$3")}`)} RETURNING ${this.projection()}`,
       [id, owner, checkpoint(previous), checkpoint(next)],
       `${leaseTimes}, execution_state`,
       this.runningOwner(),
@@ -468,7 +473,7 @@ export class TaskRepository<I extends TaskId = string> {
     failure: Failure,
     policy: RetryPolicy,
     expired: boolean,
-    completion?: Pick<Completion, "result"> & { expectedType?: string },
+    completion?: FailureCompletion,
   ) {
     if (
       !policy.delays.length ||
@@ -479,9 +484,10 @@ export class TaskRepository<I extends TaskId = string> {
       ? "t.id=$1 AND t.status='running' AND ($2::uuid IS NULL OR t.lease_id=$2)"
       : this.runningOwner();
     const candidate = `${ownerCandidate} AND ($13::text IS NULL OR t.type=$13)`;
+    const progress = completion?.checkpoint;
     const eligible = expired
       ? `(locked.lease_expires_at<=clock_timestamp() OR locked.started_at+${HARD_SLICE_MS}*interval '1 millisecond'<=clock_timestamp())`
-      : this.unexpiredLease("locked");
+      : `${this.unexpiredLease("locked")}${progress ? ` AND ${checkpointMatches("$14")}` : ""}`;
     const count = `${failureCountSql()}+1`;
     const again = `$4 AND execution_mode='queue' AND ($5::integer IS NULL OR ${count}<$5)`;
     const next = `greatest(clock_timestamp()+($6::double precision[])[least(array_length($6::double precision[],1),${count})]*interval '1 minute',COALESCE($7::timestamptz,clock_timestamp()))`;
@@ -495,6 +501,7 @@ export class TaskRepository<I extends TaskId = string> {
       fail_reasons=fail_reasons||jsonb_build_array(jsonb_build_object('failedAt',to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),'runAttempt',run_attempts,'phase',$9::text,'resultCode',$3::text,'diagnostics',$10::jsonb,'retryable',$4::boolean)),
       last_failed_run_attempt=run_attempts,last_failed_at=clock_timestamp(),result_code=$3,
       result=CASE WHEN $11 THEN $12::jsonb ELSE result END,
+      ${progress ? "execution_state=$15::jsonb," : ""}
       execution_ms=${this.elapsed()},lease_id=NULL,lease_expires_at=NULL,started_at=NULL,next_dispatch_at=NULL,updated_at=clock_timestamp()
       WHERE ${this.lockedRowWhere(eligible)} RETURNING ${this.projection()}`,
       [
@@ -511,8 +518,9 @@ export class TaskRepository<I extends TaskId = string> {
         completion?.result !== undefined,
         JSON.stringify(completion?.result ?? null),
         completion?.expectedType ?? null,
+        ...(progress ? [checkpoint(progress.previous), checkpoint(progress.next)] : []),
       ],
-      leaseTimes,
+      progress ? `${leaseTimes}, execution_state` : leaseTimes,
       candidate,
     );
   }
@@ -522,7 +530,7 @@ export class TaskRepository<I extends TaskId = string> {
     owner: string,
     failure: Failure,
     policy: RetryPolicy,
-    completion?: Pick<Completion, "result"> & { expectedType?: string },
+    completion?: FailureCompletion,
   ) {
     return this.fail(tx, id, owner, failure, policy, false, completion);
   }

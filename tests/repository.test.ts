@@ -261,6 +261,10 @@ const writesAfterRenewal = [
     repo.completeInTx(client, id, lease, { resultCode: "DONE" }), "succeeded"],
   ["failure", (client: pg.PoolClient, id: string, lease: string) =>
     repo.failInTx(client, id, lease, failure, policy), "retry_wait"],
+  ["failure with checkpoint", (client: pg.PoolClient, id: string, lease: string) =>
+    repo.failInTx(client, id, lease, failure, policy, {
+      checkpoint: { previous: { step: 1 }, next: { step: 2 } },
+    }), "retry_wait"],
   ["migration pause", (client: pg.PoolClient, id: string) =>
     repo.stopForMigrationInTx(client, id), undefined],
 ] as const;
@@ -305,8 +309,9 @@ for (const [operation, write, status] of writesAfterRenewal) {
         assert.equal(result?.status, status);
       }
       assert.equal(stored?.status, status ?? "running");
-      assert.deepEqual(stored?.executionState, { step: operation === "checkpoint" ? 2 : 1 });
-      if (operation === "failure") assert.equal(stored?.failureCount, 1);
+      const writesCheckpoint = operation === "checkpoint" || operation === "failure with checkpoint";
+      assert.deepEqual(stored?.executionState, { step: writesCheckpoint ? 2 : 1 });
+      if (operation.startsWith("failure")) assert.equal(stored?.failureCount, 1);
     } finally {
       if (pending) await Promise.allSettled([pending]);
       writer.release();
@@ -351,6 +356,32 @@ integration("failure requires the expected task type when supplied", async () =>
   });
   assert.equal(failed?.status, "retry_wait");
   assert.equal(failed?.failureCount, 1);
+});
+
+integration("failure saves a matching checkpoint and retry state in one statement", async () => {
+  const running = await claim((await create()).id);
+  const owner = running.leaseId!;
+  assert.equal(await repo.failInTx(pool!, running.id, owner, failure, policy, {
+    checkpoint: { previous: { cursor: 8 }, next: { cursor: 9 } },
+  }), null);
+  const current = await repo.readInTx(pool!, running.id);
+  assert.equal(current?.status, "running");
+  assert.equal(current?.executionState, null);
+  assert.equal(current?.failureCount, 0);
+
+  let statements = 0;
+  const failed = await repo.failInTx({
+    query(statement, values) {
+      statements++;
+      return pool!.query(statement, values);
+    },
+  }, running.id, owner, failure, policy, {
+    checkpoint: { previous: null, next: { cursor: 9 } },
+  });
+  assert.equal(statements, 1);
+  assert.equal(failed?.status, "retry_wait");
+  assert.equal(failed?.failureCount, 1);
+  assert.deepEqual(failed?.executionState, { cursor: 9 });
 });
 
 integration("claim reads the actual schedule after a competing write", async () => {
