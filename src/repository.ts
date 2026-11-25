@@ -25,6 +25,12 @@ type FailureCompletion = Pick<Completion, "result"> & {
   expectedType?: string;
   checkpoint?: { previous: Json | null; next: Json };
 };
+type ScopedRevocation = {
+  leaseId: string;
+  type: string;
+  userId: string | null;
+  timeoutCode: string;
+};
 const names = [
   "id",
   "request_key",
@@ -473,21 +479,29 @@ export class TaskRepository<I extends TaskId = string> {
     failure: Failure,
     policy: RetryPolicy,
     expired: boolean,
-    completion?: FailureCompletion,
+    completion?: FailureCompletion & { revocation?: ScopedRevocation },
   ) {
     if (
       !policy.delays.length ||
       policy.delays.some((d) => !Number.isFinite(d) || d < 0)
     )
       throw new RangeError("Invalid retry delays");
-    const ownerCandidate = expired
+    const revoked = completion?.revocation;
+    const ownerCandidate = expired && !revoked
       ? "t.id=$1 AND t.status='running' AND ($2::uuid IS NULL OR t.lease_id=$2)"
       : this.runningOwner();
-    const candidate = `${ownerCandidate} AND ($13::text IS NULL OR t.type=$13)`;
+    const scope = revoked
+      ? "t.type=$13 AND t.user_id IS NOT DISTINCT FROM $14::uuid"
+      : "($13::text IS NULL OR t.type=$13)";
+    const candidate = `${ownerCandidate} AND ${scope}`;
     const progress = completion?.checkpoint;
+    const hardExpired = `locked.started_at+${HARD_SLICE_MS}*interval '1 millisecond'<=clock_timestamp()`;
     const eligible = expired
-      ? `(locked.lease_expires_at<=clock_timestamp() OR locked.started_at+${HARD_SLICE_MS}*interval '1 millisecond'<=clock_timestamp())`
+      ? `(locked.lease_expires_at<=clock_timestamp() OR ${hardExpired})`
       : `${this.unexpiredLease("locked")}${progress ? ` AND ${checkpointMatches("$14")}` : ""}`;
+    const code = revoked
+      ? `(SELECT CASE WHEN ${hardExpired} THEN $15::text ELSE $3::text END FROM legato_locked AS locked)`
+      : "$3::text";
     const count = `${failureCountSql()}+1`;
     const again = `$4 AND execution_mode='queue' AND ($5::integer IS NULL OR ${count}<$5)`;
     const next = `greatest(clock_timestamp()+($6::double precision[])[least(array_length($6::double precision[],1),${count})]*interval '1 minute',COALESCE($7::timestamptz,clock_timestamp()))`;
@@ -498,8 +512,8 @@ export class TaskRepository<I extends TaskId = string> {
       status=CASE WHEN $8 THEN 'manual' WHEN ${retry} THEN 'retry_wait' ELSE 'failed' END,
       next_run_at=CASE WHEN ${retry} THEN ${next} ELSE clock_timestamp() END,
       finished_at=CASE WHEN $8 OR ${retry} THEN NULL ELSE clock_timestamp() END,
-      fail_reasons=fail_reasons||jsonb_build_array(jsonb_build_object('failedAt',to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),'runAttempt',run_attempts,'phase',$9::text,'resultCode',$3::text,'diagnostics',$10::jsonb,'retryable',$4::boolean)),
-      last_failed_run_attempt=run_attempts,last_failed_at=clock_timestamp(),result_code=$3,
+      fail_reasons=fail_reasons||jsonb_build_array(jsonb_build_object('failedAt',to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),'runAttempt',run_attempts,'phase',$9::text,'resultCode',${code},'diagnostics',$10::jsonb,'retryable',$4::boolean)),
+      last_failed_run_attempt=run_attempts,last_failed_at=clock_timestamp(),result_code=${code},
       result=CASE WHEN $11 THEN $12::jsonb ELSE result END,
       ${progress ? "execution_state=$15::jsonb," : ""}
       execution_ms=${this.elapsed()},lease_id=NULL,lease_expires_at=NULL,started_at=NULL,next_dispatch_at=NULL,updated_at=clock_timestamp()
@@ -518,7 +532,9 @@ export class TaskRepository<I extends TaskId = string> {
         completion?.result !== undefined,
         JSON.stringify(completion?.result ?? null),
         completion?.expectedType ?? null,
-        ...(progress ? [checkpoint(progress.previous), checkpoint(progress.next)] : []),
+        ...(revoked
+          ? [revoked.userId, revoked.timeoutCode]
+          : progress ? [checkpoint(progress.previous), checkpoint(progress.next)] : []),
       ],
       progress ? `${leaseTimes}, execution_state` : leaseTimes,
       candidate,
@@ -539,9 +555,12 @@ export class TaskRepository<I extends TaskId = string> {
     id: I,
     failure: Failure,
     policy: RetryPolicy,
-    owner?: string,
+    owner?: string | ScopedRevocation,
   ) {
-    return this.fail(tx, id, owner ?? null, failure, policy, true);
+    const revocation = typeof owner === "object" ? owner : undefined;
+    const leaseId = typeof owner === "string" ? owner : revocation?.leaseId ?? null;
+    return this.fail(tx, id, leaseId, failure, policy, true,
+      revocation ? { expectedType: revocation.type, revocation } : undefined);
   }
   async reserveDispatchInTx(tx: Sql, id: I, limit?: number | null) {
     const reservation = await this.reserveDispatchByTypeInTx(tx, id, new Map(), limit ?? null);

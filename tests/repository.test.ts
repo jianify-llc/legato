@@ -265,6 +265,10 @@ const writesAfterRenewal = [
     repo.failInTx(client, id, lease, failure, policy, {
       checkpoint: { previous: { step: 1 }, next: { step: 2 } },
     }), "retry_wait"],
+  ["scoped revocation", (client: pg.PoolClient, id: string, lease: string) =>
+    repo.revokeInTx(client, id, failure, policy, {
+      leaseId: lease, type: "test", userId: null, timeoutCode: "HARD_TIMEOUT",
+    }), undefined],
   ["migration pause", (client: pg.PoolClient, id: string) =>
     repo.stopForMigrationInTx(client, id), undefined],
 ] as const;
@@ -382,6 +386,51 @@ integration("failure saves a matching checkpoint and retry state in one statemen
   assert.equal(failed?.status, "retry_wait");
   assert.equal(failed?.failureCount, 1);
   assert.deepEqual(failed?.executionState, { cursor: 9 });
+});
+
+integration("scoped revocation classifies the expiry after waiting and matches the actual task", async () => {
+  const running = await claim((await create()).id);
+  const scope = {
+    leaseId: running.leaseId!, type: running.type, userId: null, timeoutCode: "HARD_TIMEOUT",
+  };
+  const writer = await pool!.connect();
+  let pending: Promise<TaskRecord<string> | null> | undefined;
+  try {
+    const pid = (await writer.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+    const { rows: [timing] } = await query(
+      `UPDATE "${schema}".queue_tasks
+       SET started_at=clock_timestamp()-interval '839 seconds', lease_expires_at=clock_timestamp()
+       WHERE id=$1 RETURNING started_at+interval '840 seconds' AS deadline`,
+      [running.id],
+    );
+    await tx(async (blocker) => {
+      await blocker.query(`SELECT id FROM "${schema}".queue_tasks WHERE id=$1 FOR NO KEY UPDATE`, [running.id]);
+      assert.equal(await repo.revokeInTx(pool!, running.id, failure, policy, { ...scope, type: "other" }), null);
+      assert.equal(await repo.revokeInTx(pool!, running.id, failure, policy, { ...scope, userId: crypto.randomUUID() }), null);
+      pending = repo.revokeInTx(writer, running.id, failure, policy, scope);
+      let blocked = false;
+      for (let i = 0; i < 100 && !blocked; i++) {
+        const check = await query(
+          `SELECT cardinality(pg_blocking_pids($1))>0 AS blocked,
+                  clock_timestamp()<$2::timestamptz AS before_deadline FROM pg_sleep(0.005)`,
+          [pid, timing.deadline],
+        );
+        blocked = check.rows[0].blocked;
+        if (blocked) assert.equal(check.rows[0].before_deadline, true);
+      }
+      assert.equal(blocked, true);
+      await blocker.query("SELECT pg_sleep(greatest(0,extract(epoch FROM ($1::timestamptz-clock_timestamp())))+0.02)", [timing.deadline]);
+    });
+    const expired = await pending;
+    assert.equal(expired?.resultCode, "HARD_TIMEOUT");
+    assert.equal(expired?.failureCount, 1);
+    const { rows: [stored] } = await query(`SELECT fail_reasons FROM "${schema}".queue_tasks WHERE id=$1`, [running.id]);
+    assert.equal(stored.fail_reasons[0].resultCode, "HARD_TIMEOUT");
+    assert.equal(await repo.revokeInTx(pool!, running.id, failure, policy, scope), null);
+  } finally {
+    if (pending) await Promise.allSettled([pending]);
+    writer.release();
+  }
 });
 
 integration("claim reads the actual schedule after a competing write", async () => {
