@@ -116,6 +116,7 @@ test("abort rejection waits for timeout settlement before returning", async () =
 test("cooperative hard checks and already-expired entries revoke exactly once", async () => {
   for (const alreadyExpired of [true, false]) {
     let revoked = 0;
+    let executions = 0;
     await assert.rejects(
       runSlice({
         startedAt: new Date(
@@ -123,18 +124,23 @@ test("cooperative hard checks and already-expired entries revoke exactly once", 
         ),
         leaseExpiresAt: new Date(Date.now() + 60_000),
         renew: async () => null,
-        execute: async (budget) => {
+        execute: (budget) => {
+          executions++;
           const end = Date.now() + 30;
           while (Date.now() < end) {} // Deliberately prevent timer callbacks from hiding a synchronous guard failure.
           budget.assertActive();
+          return Promise.resolve();
         },
         onTimeout: async () => {
           revoked++;
+          // Leave revocation pending long enough for a due hard timer to fire.
+          await new Promise<void>((resolve) => setTimeout(resolve, 15));
         },
       }),
       TaskTimeout,
     );
     assert.equal(revoked, 1);
+    if (alreadyExpired) assert.equal(executions, 0);
   }
 });
 

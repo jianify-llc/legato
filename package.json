@@ -1,6 +1,6 @@
 {
   "name": "@jianify/legato",
-  "version": "0.1.0-renew.4",
+  "version": "0.1.0-renew.5",
   "description": "Checkpointable TypeScript tasks with PostgreSQL ownership and Queue notifications",
   "license": "Apache-2.0",
   "type": "module",
